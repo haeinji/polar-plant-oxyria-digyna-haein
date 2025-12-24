@@ -33,7 +33,6 @@ PLOTLY_FONT_FAMILY = "Malgun Gothic, Apple SD Gothic Neo, Noto Sans KR, sans-ser
 SCHOOLS = ["송도고", "하늘고", "아라고", "동산고"]
 SCHOOL_LABEL_ALL = "전체"
 
-# EC targets (given)
 EC_TARGET_BY_SCHOOL = {
     "송도고": 1.0,
     "하늘고": 2.0,  # 최적
@@ -41,7 +40,6 @@ EC_TARGET_BY_SCHOOL = {
     "동산고": 8.0,
 }
 
-# Colors
 COLOR_BY_SCHOOL = {
     "송도고": "#1f77b4",
     "하늘고": "#2ca02c",
@@ -49,6 +47,7 @@ COLOR_BY_SCHOOL = {
     "동산고": "#d62728",
 }
 
+# 논리 파일명(확장자 앞 '_' 유무는 매칭 함수에서 자동 처리)
 ENV_CSV_LOGICAL_NAMES = [
     "송도고_환경데이터.csv",
     "하늘고_환경데이터.csv",
@@ -57,11 +56,15 @@ ENV_CSV_LOGICAL_NAMES = [
 ]
 GROWTH_XLSX_LOGICAL_NAME = "4개교_생육결과데이터.xlsx"
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+# data/에 없을 수도 있어서 루트도 함께 탐색(둘 다 iterdir만 사용)
+SEARCH_DIRS = [DATA_DIR, BASE_DIR]
 
 
 # -----------------------------
-# Helpers: NFC/NFD robust matching
+# Helpers: NFC/NFD robust matching + filename canonicalization
 # -----------------------------
 def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
@@ -71,34 +74,89 @@ def _nfd(s: str) -> str:
     return unicodedata.normalize("NFD", s)
 
 
+def _canonical_filename(name: str) -> str:
+    """
+    파일명 비교를 위한 표준화:
+    - NFC 정규화
+    - 확장자 앞의 불필요한 '_' / 공백 제거: '데이터_.csv' -> '데이터.csv'
+    - 연속 '_' 축약
+    - 확장자는 소문자
+    """
+    n = _nfc(str(name)).strip()
+
+    # split extension safely
+    dot = n.rfind(".")
+    if dot == -1:
+        stem = n
+        ext = ""
+    else:
+        stem = n[:dot]
+        ext = n[dot:].lower()
+
+    # remove trailing underscores/spaces from stem (핵심: '...데이터_' 제거)
+    stem = stem.rstrip(" _\t")
+
+    # collapse multiple underscores in stem
+    while "__" in stem:
+        stem = stem.replace("__", "_")
+
+    # also trim around underscores (optional robustness)
+    stem = stem.replace(" _", "_").replace("_ ", "_").strip()
+
+    return stem + ext
+
+
 def _same_name(a: str, b: str) -> bool:
+    """
+    Bidirectional NFC/NFD + canonical form comparison.
+    """
     a0 = str(a).strip()
     b0 = str(b).strip()
     if a0 == b0:
         return True
-    return (
+
+    # raw NFC/NFD comparisons
+    if (
         _nfc(a0) == _nfc(b0)
         or _nfd(a0) == _nfd(b0)
         or _nfc(a0) == _nfd(b0)
         or _nfd(a0) == _nfc(b0)
+    ):
+        return True
+
+    # canonical comparisons (handles trailing '_' before extension etc.)
+    ca = _canonical_filename(a0)
+    cb = _canonical_filename(b0)
+    if ca == cb:
+        return True
+
+    # canonical + NFD cross
+    return (
+        _nfc(ca) == _nfc(cb)
+        or _nfd(ca) == _nfd(cb)
+        or _nfc(ca) == _nfd(cb)
+        or _nfd(ca) == _nfc(cb)
     )
 
 
-def find_file_by_logical_name(directory: Path, logical_name: str) -> Path | None:
+def find_file_by_logical_name(search_dirs: list[Path], logical_name: str) -> Path | None:
     """
-    Must use Path.iterdir(), and NFC/NFD bidirectional comparison.
+    Must use Path.iterdir(). No glob-only.
+    Also searches multiple dirs (data/, project root) safely.
     """
-    if not directory.exists():
-        return None
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
 
-    for p in directory.iterdir():
-        if p.is_file() and _same_name(p.name, logical_name):
-            return p
+        for p in directory.iterdir():
+            if p.is_file() and _same_name(p.name, logical_name):
+                return p
 
-    # fallback (case-insensitive, extra-safe)
-    for p in directory.iterdir():
-        if p.is_file() and _nfc(p.name).lower() == _nfc(logical_name).lower():
-            return p
+        # fallback: case-insensitive match on canonical (extra safe)
+        target = _canonical_filename(logical_name).lower()
+        for p in directory.iterdir():
+            if p.is_file() and _canonical_filename(p.name).lower() == target:
+                return p
 
     return None
 
@@ -121,7 +179,6 @@ def ensure_env_schema(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("환경 데이터에 필요한 컬럼이 누락되었습니다: " + ", ".join(missing))
 
     df2["time"] = pd.to_datetime(df2["time"], errors="coerce")
-
     for c in ["temperature", "humidity", "ph", "ec"]:
         df2[c] = pd.to_numeric(df2[c], errors="coerce")
 
@@ -149,10 +206,10 @@ def ensure_growth_schema(df: pd.DataFrame) -> pd.DataFrame:
 # Data loading (cached)
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def load_environment_data(data_dir: Path) -> pd.DataFrame:
+def load_environment_data(search_dirs: list[Path]) -> pd.DataFrame:
     rows = []
     for logical in ENV_CSV_LOGICAL_NAMES:
-        p = find_file_by_logical_name(data_dir, logical)
+        p = find_file_by_logical_name(search_dirs, logical)
         if p is None:
             continue
 
@@ -171,8 +228,8 @@ def load_environment_data(data_dir: Path) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_growth_data(data_dir: Path) -> pd.DataFrame:
-    p = find_file_by_logical_name(data_dir, GROWTH_XLSX_LOGICAL_NAME)
+def load_growth_data(search_dirs: list[Path]) -> pd.DataFrame:
+    p = find_file_by_logical_name(search_dirs, GROWTH_XLSX_LOGICAL_NAME)
     if p is None:
         return pd.DataFrame()
 
@@ -221,13 +278,13 @@ with st.sidebar:
 # Load data
 # -----------------------------
 with st.spinner("데이터 로딩 중..."):
-    env_df = load_environment_data(DATA_DIR)
-    growth_df = load_growth_data(DATA_DIR)
+    env_df = load_environment_data(SEARCH_DIRS)
+    growth_df = load_growth_data(SEARCH_DIRS)
 
 if env_df.empty:
-    st.error("환경 데이터(CSV)를 찾거나 읽을 수 없습니다. data/ 폴더의 파일명을 확인하세요.")
+    st.error("환경 데이터(CSV)를 찾거나 읽을 수 없습니다. data/ 또는 프로젝트 루트의 파일명을 확인하세요.")
 if growth_df.empty:
-    st.error("생육 결과 데이터(XLSX)를 찾거나 읽을 수 없습니다. data/ 폴더의 파일명을 확인하세요.")
+    st.error("생육 결과 데이터(XLSX)를 찾거나 읽을 수 없습니다. data/ 또는 프로젝트 루트의 파일명을 확인하세요.")
 
 
 def filter_by_school(df: pd.DataFrame, school_choice: str) -> pd.DataFrame:
@@ -285,7 +342,6 @@ optimal_ec = 2.0  # requirement: highlight Hanulgo (EC 2.0)
 # -----------------------------
 tab1, tab2, tab3 = st.tabs(["📖 실험 개요", "🌡️ 환경 데이터", "📊 생육 결과"])
 
-
 # =============================
 # Tab 1
 # =============================
@@ -325,7 +381,6 @@ with tab1:
     c2.metric("평균 온도(선택 범위)", "-" if pd.isna(avg_temp) else f"{avg_temp:.2f} °C")
     c3.metric("평균 습도(선택 범위)", "-" if pd.isna(avg_hum) else f"{avg_hum:.2f} %")
     c4.metric("최적 EC", f"{optimal_ec:.1f}", help="요구사항: 하늘고 EC 2.0 최적값 강조")
-
 
 # =============================
 # Tab 2
@@ -481,7 +536,6 @@ with tab2:
                 file_name="환경데이터_선택범위.csv",
                 mime="text/csv",
             )
-
 
 # =============================
 # Tab 3
