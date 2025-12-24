@@ -669,11 +669,3 @@ with tab3:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 ```
-
-```txt
-# requirements.txt
-streamlit
-pandas
-plotly
-openpyxl
-```
